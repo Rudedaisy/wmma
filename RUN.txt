@@ -1,0 +1,5 @@
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
+export PATH=$PATH:/usr/local/cuda/bin
+
+nvcc -arch=sm_86 -lcurand simpelTensorCoreGEMM.cu -o gemm
+nvcc -arch=sm_86 -lcurand testDCONV.cu -o gemm
