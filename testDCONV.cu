@@ -88,14 +88,14 @@ const int MATRIX_K = C*R*S;
 
 __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
 						const float *data_im,
-						const int k, const int n, const int warpM, const int M_stride, const int warpM_index_stride,
-						const int index, const int warpM_index, const int w_col, const int h_col, const int n_col, const int n_im, const int WMMA_SUB_TILE, __nv_bfloat16 **data_col_ptr, 
+						const int k, const int n, const int blockM, const int M_stride, const int blockM_index_stride,
+						const int index, const int blockM_index, const int w_col, const int h_col, const int n_col, const int n_im, const int WMMA_SUB_TILE, __nv_bfloat16 **data_col_ptr, 
 						const int N, const int C, const int H, const int W, const int R, const int S, const int P, const int Q,
 						const int pad_h, const int pad_w,
 						const int stride_h, const int stride_w,
 						const int dilation_h, const int dilation_w
 						) {
-  // NOTE: current implementation has all warpN's repeating the same calculation if they are under the same warpM. May cause unwanted bandwidth pressure.
+  // NOTE: current implementation has all warpN's repeating the same calculation if they are under the same blockM. May cause unwanted bandwidth pressure.
   int s_col;
   int r_col;
   int c_col;
@@ -117,23 +117,23 @@ __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
     const float *data_im_ptr = data_im + (((n_im * H + h_im) * W + w_im) * C + c_im);
     
     const int M_computed = (blockDim.x * blockDim.y) / WMMA_K;
+
+    // This if statement should not be divergent
+    if (k == 0) {
+      *data_col_ptr = data_col + (((((n_col * H + h_col) * W + w_col) * C + c_col) * R + r_col) * S + s_col);
+    } else {
+      *data_col_ptr += WMMA_K;
+    }
     
 #pragma unroll
-    for(long long unsigned i_m = 0; i_m < (M_stride / M_computed); i_m++) { 
-      // This if statement should not be divergent
-      if (k == 0) {
-	*data_col_ptr = data_col + (((((n_col * H + h_col) * W + w_col) * C + c_col) * R + r_col) * S + s_col);
-      } else {
-	*data_col_ptr += WMMA_K;
-      }
-      
+    for(long long unsigned i_m = 0; i_m < (M_stride / M_computed); i_m++) {
       float val = static_cast<float>(0);
       if (h_im > -1 && w_im > -1 && h_im < H && w_im < W){
 	val = *(data_im_ptr + i_m * M_computed * C);
       }
-      assert((*data_col_ptr + i_m * warpM_index_stride) >= data_col);
-      //assert((*data_col_ptr + i_m * warpM_index_stride) < (data_col + MATRIX_M*MATRIX_K));  ////////// ASSERT FAILS HERE, MUST CHECK
-      *(*data_col_ptr + i_m * warpM_index_stride) = __float2bfloat16(val);
+      assert((*data_col_ptr + i_m * blockM_index_stride) >= data_col);
+      assert((*data_col_ptr + i_m * blockM_index_stride) < (data_col + MATRIX_M*MATRIX_K));
+      *(*data_col_ptr + i_m * blockM_index_stride) = __float2bfloat16(val);
     }
   }
 }
@@ -171,14 +171,14 @@ __device__ float conv2d_im2col_bilinear(const float *bottom_data, const int data
 
 __device__ void fused_conv2d_im2col_and_BLI(float *data_col,
 					    const float *data_im, const float *data_offset,
-					    const int k, const int n, const int warpM, const int M_stride, const int warpM_index_stride,
-					    const int index, const int warpM_index, const int w_col, const int h_col, const int n_col, const int n_im, const int WMMA_SUB_TILE, float **data_col_ptr,
+					    const int k, const int n, const int blockM, const int M_stride, const int blockM_index_stride,
+					    const int index, const int blockM_index, const int w_col, const int h_col, const int n_col, const int n_im, const int WMMA_SUB_TILE, float **data_col_ptr,
 					    const int N, const int C, const int H, const int W, const int R, const int S, const int P, const int Q,
 					    const int pad_h, const int pad_w,
 					    const int stride_h, const int stride_w,
 					    const int dilation_h, const int dilation_w
 					    ) {
-  // NOTE: current implementation has all warpN's repeating the same calculation if they are under the same warpM. May cause unwanted bandwidth pressure.
+  // NOTE: current implementation has all warpN's repeating the same calculation if they are under the same blockM. May cause unwanted bandwidth pressure.
   int s_col;
   int r_col;
   int c_col;
@@ -218,9 +218,9 @@ __device__ void fused_conv2d_im2col_and_BLI(float *data_col,
       if (h_im > -1 && w_im > -1 && h_im < H && w_im < W){
         val = conv2d_im2col_bilinear((data_im_ptr + i_m * M_computed * C), W, H, W, h_im, w_im);
       }
-      assert((*data_col_ptr + i_m * warpM_index_stride) >= data_col);
-      //assert((*data_col_ptr + i_m * warpM_index_stride) < (data_col + MATRIX_M*MATRIX_K));
-      *(*data_col_ptr + i_m * warpM_index_stride) = val;
+      assert((*data_col_ptr + i_m * blockM_index_stride) >= data_col);
+      //assert((*data_col_ptr + i_m * blockM_index_stride) < (data_col + MATRIX_M*MATRIX_K));
+      *(*data_col_ptr + i_m * blockM_index_stride) = val;
     }
   }
 }
@@ -238,14 +238,15 @@ __global__ void stages1_2_gpu_kernel(float *offset,
 				     const int MATRIX_M, const int MATRIX_N, const int MATRIX_K, const int M_stride, const int N_stride
 				     ) {
    // Leading dimensions. Packed with no transpositions.
-   int lda = MATRIX_M;
+   int lda = MATRIX_K;
    int ldb = MATRIX_K;
    int ldc = MATRIX_M;
 
    // Tile using a 2D grid
    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
    int warpN = (blockIdx.y * blockDim.y + threadIdx.y);
-
+   int blockM = blockIdx.x;
+   
    // Declare the fragments
    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> b_frag;
@@ -259,15 +260,13 @@ __global__ void stages1_2_gpu_kernel(float *offset,
    // ***Constant variables for im2col function***
    // In 2D block, the order of threads is [major=y, minor=x]
    const int index = (threadIdx.y * blockDim.x + threadIdx.x);
-   //const int warpM_index = warpM * M_stride + (index / WMMA_K); // Incorrect, should multiply by WMMA_M
-   const int warpM_index = warpM * WMMA_M + (index / WMMA_K); // IN PROGRESS
-   assert((blockDim.x * blockDim.y) % WMMA_K == 0); // Need to be divisible for "warpM_index_stride" to be accurate
-   const int warpM_index_stride = MATRIX_K * (int)((blockDim.x * blockDim.y) / WMMA_K);
-   const int w_col = warpM_index % W;
-   const int h_col = (warpM_index / W) % H;
-   const int n_col = (warpM_index / W / H) % N;
+   const int blockM_index = blockM * M_stride + (index / WMMA_K);
+   assert((blockDim.x * blockDim.y) % WMMA_K == 0); // Need to be divisible for "blockM_index_stride" to be accurate
+   const int blockM_index_stride = MATRIX_K * (int)((blockDim.x * blockDim.y) / WMMA_K);
+   const int w_col = blockM_index % W;
+   const int h_col = (blockM_index / W) % H;
+   const int n_col = (blockM_index / W / H) % N;
    const int n_im = n_col;
-   //const int WMMA_SUB_TILE = WMMA_M * WMMA_K;
    const int WMMA_SUB_TILE = M_stride * WMMA_K;
    __nv_bfloat16 *data_col_ptr;
 
@@ -287,13 +286,13 @@ __global__ void stages1_2_gpu_kernel(float *offset,
 	// im2col + convert input_fp32 to columns_input_bf16
 	fused_conv2d_im2col_and_convert(columns_in,
 					in,
-					i, MATRIX_K, warpM, M_stride, warpM_index_stride,
-					index, warpM_index, w_col, h_col, n_col, n_im, WMMA_SUB_TILE, &data_col_ptr,
+					i, MATRIX_K, blockM, M_stride, blockM_index_stride,
+					index, blockM_index, w_col, h_col, n_col, n_im, WMMA_SUB_TILE, &data_col_ptr,
 					N, C, H, W, R, S, P, Q,
 					pad_h, pad_w,
 					stride_h, stride_w,
 					dilation_h, dilation_w);
-	
+	__syncthreads();
 	// Load the inputs
 	wmma::load_matrix_sync(a_frag, columns_in + aRow + aCol * lda, lda);
 	wmma::load_matrix_sync(b_frag, weight_offset + bRow + bCol * ldb, ldb);
@@ -337,6 +336,7 @@ int main(int argc, char* argv[]) {
    float *offset_fp32;
 
    float *offset_fp32_host;
+   __nv_bfloat16 *columns_in_bf16_host;
    
    curandGenerator_t gen;
 
@@ -360,7 +360,8 @@ int main(int argc, char* argv[]) {
    
    
    offset_fp32_host = (float*)malloc(N*C_offset*H*W * sizeof(float));
-
+   columns_in_bf16_host = (__nv_bfloat16*)malloc(N*H*W*C*R*S * sizeof(__nv_bfloat16));
+   
    curandErrCheck(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
    curandErrCheck(curandSetPseudoRandomGeneratorSeed(gen, 1337ULL));
    
@@ -381,9 +382,10 @@ int main(int argc, char* argv[]) {
    
    // blockDim.x must be a multple of warpSize
    // 128x4 means we have 16 warps and a block computes a 64x64 output tile
+   /// ED: CANNOT do 64x64 tile since N<=32. Need to halve blockDim.y
    /// ED: to transition to 4 warps, could try blockDim.x = 64, blockDim.y = 2
    blockDim.x = 128;
-   blockDim.y = 4;
+   blockDim.y = 2; // 4
 
    gridDim.x = (MATRIX_M + (WMMA_M * blockDim.x / 32 - 1)) / (WMMA_M * blockDim.x / 32);
    gridDim.y = (MATRIX_N + WMMA_N * blockDim.y - 1) / (WMMA_N * blockDim.y);
@@ -403,23 +405,25 @@ int main(int argc, char* argv[]) {
    
    printf("\nChecking results...\n");
    cudaErrCheck(cudaMemcpy(offset_fp32_host, offset_fp32, N*C_offset*H*W * sizeof(float), cudaMemcpyDeviceToHost));
+   cudaErrCheck(cudaMemcpy(columns_in_bf16_host, columns_in_bf16, N*H*W*C*R*S * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+
+   /*
    printf("Offset result (top 5x5 section)\n");
-   for (int i = 0; i < 20; i++) {
+   for (int i = 0; i < MATRIX_M; i++) {
        for (int j = 0; j < MATRIX_N; j++) {
-       	   float v1 = offset_fp32_host[i*MATRIX_M + j];
+       	   float v1 = offset_fp32_host[i*MATRIX_N + j];
        	   printf("%.3f ", v1);
-	   /*
 	   if (v1 == 0) {
 	     printf("Zero detected at idx=%d N/H/W = %d/%d/%d, K = %d\n", i, (i/W/H)%N, (i/W)%H, i%W, j);
-	     //break;
+	     exit(0);
 	   }
-	   //*/
        }
        printf("\n");
    }
    printf("Last: %f, +1: %f\n", offset_fp32_host[N*C_offset*H*W-1], offset_fp32_host[N*C_offset*H*W]);
    printf("MATRIX_M = %d\n", MATRIX_M);
-   
+   */
+
    cudaErrCheck(cudaEventDestroy(startWMMA));
    cudaErrCheck(cudaEventDestroy(stopWMMA));
    
