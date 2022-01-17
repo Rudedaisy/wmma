@@ -88,8 +88,8 @@ const int MATRIX_K = C*R*S;
 
 __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
 						const float *data_im,
-						const int k, const int n, const int blockM, const int M_stride, const int blockM_index_stride,
-						const int index, const int blockM_index, const int w_col, const int h_col, const int n_col, const int n_im, const int WMMA_SUB_TILE, __nv_bfloat16 **data_col_ptr, 
+						const int k, const int blockM, const int M_stride, const int blockM_index_stride,
+						const int index, const int w_col, const int h_col, const int n_col, const int n_im, const int WMMA_SUB_TILE, __nv_bfloat16 **data_col_ptr, 
 						const int N, const int C, const int H, const int W, const int R, const int S, const int P, const int Q,
 						const int pad_h, const int pad_w,
 						const int stride_h, const int stride_w,
@@ -113,7 +113,6 @@ __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
     const int w_im = (w_col * stride_w - pad_w) - s_displacement;
     const int h_im = (h_col * stride_h - pad_h) - r_displacement;
 
-    //const float *data_im_ptr = data_im + (((n_im * C + c_im) * H + h_im) * W + w_im);
     const float *data_im_ptr = data_im + (((n_im * H + h_im) * W + w_im) * C + c_im);
     
     const int M_computed = (blockDim.x * blockDim.y) / WMMA_K;
@@ -138,7 +137,7 @@ __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
   }
 }
 
-__device__ float conv2d_im2col_bilinear(const float *bottom_data, const int data_width,
+__device__ float conv2d_im2col_bilinear(const float *bottom_data, const int data_width, const int minor_dim,
 					const int height, const int width, float h, float w)
 {
   int h_low = floor(h);
@@ -152,16 +151,16 @@ __device__ float conv2d_im2col_bilinear(const float *bottom_data, const int data
 
   float v1 = 0;
   if (h_low >= 0 && w_low >= 0)
-    v1 = bottom_data[h_low * data_width + w_low];
+    v1 = bottom_data[(h_low * data_width + w_low) * minor_dim];
   float v2 = 0;
   if (h_low >= 0 && w_high <= width - 1)
-    v2 = bottom_data[h_low * data_width + w_high];
+    v2 = bottom_data[(h_low * data_width + w_high) * minor_dim];
   float v3 = 0;
   if (h_high <= height - 1 && w_low >= 0)
-    v3 = bottom_data[h_high * data_width + w_low];
+    v3 = bottom_data[(h_high * data_width + w_low) * minor_dim];
   float v4 = 0;
   if (h_high <= height - 1 && w_high <= width - 1)
-    v4 = bottom_data[h_high * data_width + w_high];
+    v4 = bottom_data[(h_high * data_width + w_high) * minor_dim];
 
   float w1 = hh * hw, w2 = hh * lw, w3 = lh * hw, w4 = lh * lw;
 
@@ -170,9 +169,9 @@ __device__ float conv2d_im2col_bilinear(const float *bottom_data, const int data
 }
 
 __device__ void fused_conv2d_im2col_and_BLI(float *data_col,
-					    const float *data_im, const float *data_offset,
-					    const int k, const int n, const int blockM, const int M_stride, const int blockM_index_stride,
-					    const int index, const int blockM_index, const int w_col, const int h_col, const int n_col, const int n_im, const int WMMA_SUB_TILE, float **data_col_ptr,
+					    const float *data_im, const float *data_offset_ptr,
+					    const int k, const int blockM, const int M_stride, const int blockM_index_stride,
+					    const int index, const int w_col, const int h_col, const int n_col, const int n_im, const int BLI_TILE, float **data_col_ptr,
 					    const int N, const int C, const int H, const int W, const int R, const int S, const int P, const int Q,
 					    const int pad_h, const int pad_w,
 					    const int stride_h, const int stride_w,
@@ -183,13 +182,12 @@ __device__ void fused_conv2d_im2col_and_BLI(float *data_col,
   int r_col;
   int c_col;
 
-  if (index < WMMA_SUB_TILE) {
+  if (index < BLI_TILE) {
     const int index_k = (index % WMMA_K) + k;
     s_col = index_k % S;
     r_col = (index_k / S) % R;
     c_col = (index_k / S / R) % C;
 
-    const float *data_offset_ptr = data_offset + (((n_col * H + h_col) * W + w_col) * C_offset);
     const int offset_array_idx = 2 * (r_col * S + s_col);
     const float offset_h = data_offset_ptr[offset_array_idx];
     const float offset_w = data_offset_ptr[offset_array_idx + 1];
@@ -198,25 +196,25 @@ __device__ void fused_conv2d_im2col_and_BLI(float *data_col,
     const int r_displacement = (r_col - (int)(R / 2)) * dilation_h;
 
     const int c_im = c_col;
-    const int w_im = (w_col * stride_w - pad_w) - s_displacement + offset_h; ////////////////////////////// CHECK ME: SHOULD USE OFFSET
+    const int w_im = (w_col * stride_w - pad_w) - s_displacement + offset_h;
     const int h_im = (h_col * stride_h - pad_h) - r_displacement + offset_w;
 
     const float *data_im_ptr = data_im + (((n_im * H + h_im) * W + w_im) * C + c_im);
     
     const int M_computed = (blockDim.x * blockDim.y) / WMMA_K;
 
+    // This if statement should not be divergent
+    if (k == 0) {
+      *data_col_ptr = data_col + (((((n_col * H + h_col) * W + w_col) * C + c_col) * R + r_col) * S + s_col);
+    } else {
+      *data_col_ptr += WMMA_K;
+    }
+
 #pragma unroll
     for(long long unsigned i_m = 0; i_m < (M_stride / M_computed); i_m++) {
-      // This if statement should not be divergent
-      if (k == 0) {
-        *data_col_ptr = data_col + (((((n_col * H + h_col) * W + w_col) * C + c_col) * R + r_col) * S + s_col);
-      } else {
-        *data_col_ptr += WMMA_K;
-      }
-
       float val = static_cast<float>(0);
       if (h_im > -1 && w_im > -1 && h_im < H && w_im < W){
-        val = conv2d_im2col_bilinear((data_im_ptr + i_m * M_computed * C), W, H, W, h_im, w_im);
+        val = conv2d_im2col_bilinear((data_im_ptr + i_m * blockM_index_stride), W, C, H, W, h_im, w_im);
       }
       assert((*data_col_ptr + i_m * blockM_index_stride) >= data_col);
       //assert((*data_col_ptr + i_m * blockM_index_stride) < (data_col + MATRIX_M*MATRIX_K));
@@ -231,7 +229,7 @@ __device__ void fused_conv2d_im2col_and_BLI(float *data_col,
 //  3) Neither A nor B are transposed.
 // Note: This is NOT a high performance example but is for demonstration purposes only
 //       For a high performance code please use the GEMM provided in cuBLAS.
-__global__ void stages1_2_gpu_kernel(float *offset,
+__global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
 				     float *in, __nv_bfloat16 *columns_in, __nv_bfloat16 *weight_offset, 
 				     const int N, const int C, const int C_offset, const int H, const int W, const int R, const int S, const int P, const int Q,
 				     const int pad_h, const int pad_w, const int stride_h, const int stride_w, const int dilation_h, const int dilation_w,
@@ -286,8 +284,8 @@ __global__ void stages1_2_gpu_kernel(float *offset,
 	// im2col + convert input_fp32 to columns_input_bf16
 	fused_conv2d_im2col_and_convert(columns_in,
 					in,
-					i, MATRIX_K, blockM, M_stride, blockM_index_stride,
-					index, blockM_index, w_col, h_col, n_col, n_im, WMMA_SUB_TILE, &data_col_ptr,
+					i, blockM, M_stride, blockM_index_stride,
+					index, w_col, h_col, n_col, n_im, WMMA_SUB_TILE, &data_col_ptr,
 					N, C, H, W, R, S, P, Q,
 					pad_h, pad_w,
 					stride_h, stride_w,
@@ -312,7 +310,20 @@ __global__ void stages1_2_gpu_kernel(float *offset,
    }
 
    // Perform BLI + unroll for main CONV
-   
+   const int BLI_TILE = M_stride * N_stride;
+   const float *data_offset_ptr = offset + (((n_col * H + h_col) * W + w_col) * C_offset); // C_offset = R*S*2
+   float *bli_data_col_ptr;
+#pragma unroll
+   for (int k = 0; k < MATRIX_K; k += WMMA_K) {
+     fused_conv2d_im2col_and_BLI(deformed_columns_in,
+				 in, data_offset_ptr,
+				 k, blockM, M_stride, blockM_index_stride,
+				 index, w_col, h_col, n_col, n_im, BLI_TILE, &bli_data_col_ptr,
+				 N, C, H, W, R, S, P, Q,
+				 pad_h, pad_w,
+				 stride_h, stride_w,
+				 dilation_h, dilation_w);
+   }
 }
 
 __global__ void convertFp32ToFp16 (__nv_bfloat16 *out, float *in, int n) {
@@ -334,9 +345,10 @@ int main(int argc, char* argv[]) {
    __nv_bfloat16 *columns_in_bf16;
    __nv_bfloat16 *weight_offset_bf16;
    float *offset_fp32;
+   float *deformed_columns_in_fp32;
 
    float *offset_fp32_host;
-   __nv_bfloat16 *columns_in_bf16_host;
+   float *deformed_columns_in_fp32_host;
    
    curandGenerator_t gen;
 
@@ -357,10 +369,10 @@ int main(int argc, char* argv[]) {
    cudaErrCheck(cudaMalloc((void**)&columns_in_bf16, N*H*W*C*R*S * sizeof(__nv_bfloat16)));
    cudaErrCheck(cudaMalloc((void**)&weight_offset_bf16, C_offset*C*R*S * sizeof(__nv_bfloat16)));
    cudaErrCheck(cudaMalloc((void**)&offset_fp32, N*C_offset*H*W * sizeof(float)));
-   
+   cudaErrCheck(cudaMalloc((void**)&deformed_columns_in_fp32, N*H*W*C*R*S * sizeof(float)));
    
    offset_fp32_host = (float*)malloc(N*C_offset*H*W * sizeof(float));
-   columns_in_bf16_host = (__nv_bfloat16*)malloc(N*H*W*C*R*S * sizeof(__nv_bfloat16));
+   deformed_columns_in_fp32_host = (float*)malloc(N*H*W*C*R*S * sizeof(float));
    
    curandErrCheck(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
    curandErrCheck(curandSetPseudoRandomGeneratorSeed(gen, 1337ULL));
@@ -396,33 +408,53 @@ int main(int argc, char* argv[]) {
    printf("Running with wmma...\n");
    cudaErrCheck(cudaEventRecord(startWMMA));
    
-   stages1_2_gpu_kernel <<< gridDim, blockDim >>> (offset_fp32,
+   stages1_2_gpu_kernel <<< gridDim, blockDim >>> (offset_fp32, deformed_columns_in_fp32,
 						   in_fp32, columns_in_bf16, weight_offset_bf16,
 						   N, C, C_offset, H, W, R, S, P, Q,
 						   pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,
-						   MATRIX_M, MATRIX_N, MATRIX_K, M_stride, N_stride); //////////////////////////////////////////
+						   MATRIX_M, MATRIX_N, MATRIX_K, M_stride, N_stride);
    cudaErrCheck(cudaEventRecord(stopWMMA));
    
    printf("\nChecking results...\n");
    cudaErrCheck(cudaMemcpy(offset_fp32_host, offset_fp32, N*C_offset*H*W * sizeof(float), cudaMemcpyDeviceToHost));
-   cudaErrCheck(cudaMemcpy(columns_in_bf16_host, columns_in_bf16, N*H*W*C*R*S * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
-
+   cudaErrCheck(cudaMemcpy(deformed_columns_in_fp32_host, deformed_columns_in_fp32, N*H*W*C*R*S * sizeof(float), cudaMemcpyDeviceToHost));
+   
    /*
-   printf("Offset result (top 5x5 section)\n");
+   printf("Offset result\n");
    for (int i = 0; i < MATRIX_M; i++) {
        for (int j = 0; j < MATRIX_N; j++) {
        	   float v1 = offset_fp32_host[i*MATRIX_N + j];
-       	   printf("%.3f ", v1);
-	   if (v1 == 0) {
-	     printf("Zero detected at idx=%d N/H/W = %d/%d/%d, K = %d\n", i, (i/W/H)%N, (i/W)%H, i%W, j);
-	     exit(0);
+       	   //printf("%.3f ", v1);
+	   //if (v1 == 0) {
+	   //  printf("Zero detected at idx=%d N/H/W = %d/%d/%d, K = %d\n", i, (i/W/H)%N, (i/W)%H, i%W, j);
+	   //  exit(0);
+	   //}
+	   if (v1 < 64) {
+	     printf("Reasonable offset detected at idx=%d N/H/W = %d/%d/%d, K = %d. VALUE = %f\n", i, (i/W/H)%N, (i/W)%H, i%W, j, v1);
+	   }
+	   else {
+	     printf("*Unreasonable offset detected at idx=%d N/H/W = %d/%d/%d, K = %d. VALUE = %f\n", i, (i/W/H)%N, (i/W)%H, i%W, j, v1);
 	   }
        }
-       printf("\n");
+       //printf("\n");
    }
    printf("Last: %f, +1: %f\n", offset_fp32_host[N*C_offset*H*W-1], offset_fp32_host[N*C_offset*H*W]);
    printf("MATRIX_M = %d\n", MATRIX_M);
-   */
+   //*/
+
+   /*
+   printf("Deformed result:\n");
+   for (int i = 0; i < MATRIX_M; i++) {
+     for (int j = 0; j < MATRIX_K; j++) {
+       //printf("%.3f ", deformed_columns_in_fp32_host[i*MATRIX_K + j]);
+       if (deformed_columns_in_fp32_host[i*MATRIX_K + j] == 0) {
+	 printf("\nZero detected at idx=%d N/H/W = %d/%d/%d, C/R/S = %d/%d/%d\n", i, (i/W/H)%N, (i/W)%H, i%W, (j/R/S)%C, (j/S)%R, j%S);
+	 exit(0);
+       }
+     }
+     //printf("\n");
+   }
+   //*/
 
    cudaErrCheck(cudaEventDestroy(startWMMA));
    cudaErrCheck(cudaEventDestroy(stopWMMA));
