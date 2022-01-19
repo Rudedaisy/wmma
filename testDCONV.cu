@@ -101,7 +101,7 @@ __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
   int c_col;
 
   if (index < WMMA_SUB_TILE) {
-    const int index_k = (index % WMMA_K) + k;
+    const int index_k = (index % (WMMA_K*2)) + k;
     s_col = index_k % S;
     r_col = (index_k / S) % R;
     c_col = (index_k / S / R) % C;
@@ -115,13 +115,13 @@ __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
 
     const float *data_im_ptr = data_im + (((n_im * H + h_im) * W + w_im) * C + c_im);
     
-    const int M_computed = (blockDim.x * blockDim.y) / WMMA_K;
+    const int M_computed = (blockDim.x * blockDim.y) / (WMMA_K*2);
 
     // This if statement should not be divergent
     if (k == 0) {
       *data_col_ptr = data_col + (((((n_col * H + h_col) * W + w_col) * C + c_col) * R + r_col) * S + s_col);
     } else {
-      *data_col_ptr += WMMA_K;
+      *data_col_ptr += (WMMA_K*2);
     }
     
 #pragma unroll
@@ -256,15 +256,16 @@ __global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
    // ***Constant variables for im2col function***
    // In 2D block, the order of threads is [major=y, minor=x]
    const int index = (threadIdx.y * blockDim.x + threadIdx.x);
-   const int blockM_index = blockM * M_stride + (index / WMMA_K);
+   const int blockM_index = blockM * M_stride + (index / (WMMA_K*2));
    assert((blockDim.x * blockDim.y) % WMMA_K == 0); // Need to be divisible for "blockM_index_stride" to be accurate
-   const int blockM_index_stride = MATRIX_K * (int)((blockDim.x * blockDim.y) / WMMA_K);
+   const int blockM_index_stride = MATRIX_K * (int)((blockDim.x * blockDim.y) / (WMMA_K*2));
    const int w_col = blockM_index % W;
    const int h_col = (blockM_index / W) % H;
    const int n_col = (blockM_index / W / H) % N;
    const int n_im = n_col;
-   const int WMMA_SUB_TILE = M_stride * WMMA_K;
+   const int WMMA_SUB_TILE = M_stride * (WMMA_K*2);
    __nv_bfloat16 *data_col_ptr;
+
 
    // Loop over k
 #pragma	unroll
@@ -278,17 +279,19 @@ __global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
       // Bounds checking
       if (aRow < MATRIX_M && aCol < MATRIX_K && bRow < MATRIX_K && bCol < MATRIX_N) {
 	assert((aRow+WMMA_M) <= MATRIX_M && (aCol+WMMA_K) <= MATRIX_K && (bRow+WMMA_K) <= MATRIX_K && (bCol+WMMA_N) <= MATRIX_N); // Matrices need to be divisible by the WMMA dims
-	
+
+	if (i % (WMMA_K*2) == 0) {
 	// im2col + convert input_fp32 to columns_input_bf16
-	fused_conv2d_im2col_and_convert(columns_in,
-					in,
-					i, blockM, M_stride, blockM_index_stride,
-					index, w_col, h_col, n_col, n_im, WMMA_SUB_TILE, &data_col_ptr,
-					N, C, H, W, R, S, P, Q,
-					pad_h, pad_w,
-					stride_h, stride_w,
-					dilation_h, dilation_w);
-	__syncthreads();
+	  fused_conv2d_im2col_and_convert(columns_in,
+					  in,
+					  i, blockM, M_stride, blockM_index_stride,
+					  index, w_col, h_col, n_col, n_im, WMMA_SUB_TILE, &data_col_ptr,
+					  N, C, H, W, R, S, P, Q,
+					  pad_h, pad_w,
+					  stride_h, stride_w,
+					  dilation_h, dilation_w);
+	  __syncthreads();
+	}
 	// Load the inputs
 	wmma::load_matrix_sync(a_frag, columns_in + aRow + aCol * lda, lda);
 	wmma::load_matrix_sync(b_frag, weight_offset + bRow + bCol * ldb, ldb);
