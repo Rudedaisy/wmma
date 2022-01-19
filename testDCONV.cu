@@ -227,8 +227,6 @@ __device__ void fused_conv2d_im2col_and_BLI(float *data_col,
 //  1) Matrices are packed in memory.
 //  2) M, N and K are multiples of 16. 
 //  3) Neither A nor B are transposed.
-// Note: This is NOT a high performance example but is for demonstration purposes only
-//       For a high performance code please use the GEMM provided in cuBLAS.
 __global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
 				     float *in, __nv_bfloat16 *columns_in, __nv_bfloat16 *weight_offset, 
 				     const int N, const int C, const int C_offset, const int H, const int W, const int R, const int S, const int P, const int Q,
@@ -396,7 +394,7 @@ int main(int argc, char* argv[]) {
    // 128x4 means we have 16 warps and a block computes a 64x64 output tile
    /// ED: CANNOT do 64x64 tile since N<=32. Need to halve blockDim.y
    /// ED: to transition to 4 warps, could try blockDim.x = 64, blockDim.y = 2
-   blockDim.x = 128;
+   blockDim.x = 256; //128;
    blockDim.y = 2; // 4
 
    gridDim.x = (MATRIX_M + (WMMA_M * blockDim.x / 32 - 1)) / (WMMA_M * blockDim.x / 32);
@@ -414,6 +412,22 @@ int main(int argc, char* argv[]) {
 						   pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,
 						   MATRIX_M, MATRIX_N, MATRIX_K, M_stride, N_stride);
    cudaErrCheck(cudaEventRecord(stopWMMA));
+   cudaErrCheck(cudaEventSynchronize(stopWMMA)); // Make sure event is done being recorded
+   // check for error
+   cudaError_t error = cudaGetLastError();
+   if(error != cudaSuccess) {
+     // print the CUDA error message and exit
+     printf("CUDA error: %s\n", cudaGetErrorString(error));
+     exit(-1);
+   }
+
+
+   
+   printf("\nPerformance timing:\n");
+   float ms = 0;
+   cudaErrCheck(cudaEventElapsedTime(&ms, startWMMA, stopWMMA));
+   printf("\t%f ms\n", ms);
+
    
    printf("\nChecking results...\n");
    cudaErrCheck(cudaMemcpy(offset_fp32_host, offset_fp32, N*C_offset*H*W * sizeof(float), cudaMemcpyDeviceToHost));
