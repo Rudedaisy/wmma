@@ -130,8 +130,8 @@ __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
       if (h_im > -1 && w_im > -1 && h_im < H && w_im < W){
 	val = *(data_im_ptr + i_m * M_computed * C);
       }
-      assert((*data_col_ptr + i_m * blockM_index_stride) >= data_col);
-      assert((*data_col_ptr + i_m * blockM_index_stride) < (data_col + MATRIX_M*MATRIX_K));
+      //assert((*data_col_ptr + i_m * blockM_index_stride) >= data_col);
+      //assert((*data_col_ptr + i_m * blockM_index_stride) < (data_col + MATRIX_M*MATRIX_K));
       *(*data_col_ptr + i_m * blockM_index_stride) = __float2bfloat16(val);
     }
   }
@@ -257,7 +257,7 @@ __global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
    // In 2D block, the order of threads is [major=y, minor=x]
    const int index = (threadIdx.y * blockDim.x + threadIdx.x);
    const int blockM_index = blockM * M_stride + (index / (WMMA_K*2));
-   assert((blockDim.x * blockDim.y) % WMMA_K == 0); // Need to be divisible for "blockM_index_stride" to be accurate
+   //assert((blockDim.x * blockDim.y) % WMMA_K == 0); // Need to be divisible for "blockM_index_stride" to be accurate
    const int blockM_index_stride = MATRIX_K * (int)((blockDim.x * blockDim.y) / (WMMA_K*2));
    const int w_col = blockM_index % W;
    const int h_col = (blockM_index / W) % H;
@@ -278,8 +278,8 @@ __global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
 
       // Bounds checking
       if (aRow < MATRIX_M && aCol < MATRIX_K && bRow < MATRIX_K && bCol < MATRIX_N) {
-	assert((aRow+WMMA_M) <= MATRIX_M && (aCol+WMMA_K) <= MATRIX_K && (bRow+WMMA_K) <= MATRIX_K && (bCol+WMMA_N) <= MATRIX_N); // Matrices need to be divisible by the WMMA dims
-
+	//assert((aRow+WMMA_M) <= MATRIX_M && (aCol+WMMA_K) <= MATRIX_K && (bRow+WMMA_K) <= MATRIX_K && (bCol+WMMA_N) <= MATRIX_N); // Matrices need to be divisible by the WMMA dims
+	
 	if (i % (WMMA_K*2) == 0) {
 	// im2col + convert input_fp32 to columns_input_bf16
 	  fused_conv2d_im2col_and_convert(columns_in,
@@ -309,7 +309,7 @@ __global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
      wmma::store_matrix_sync(offset + cRow + cCol * ldc, acc_frag, ldc, wmma::mem_col_major);
      //wmma::store_matrix_sync(offsetsss, acc_frag, 64, wmma::mem_col_major);
    }
-
+   
    // Perform BLI + unroll for main CONV
    const int BLI_TILE = M_stride * N_stride;
    const float *data_offset_ptr = offset + (((n_col * H + h_col) * W + w_col) * C_offset); // C_offset = R*S*2
