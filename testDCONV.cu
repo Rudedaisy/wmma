@@ -95,7 +95,6 @@ __device__ void fused_conv2d_im2col_and_convert(__nv_bfloat16 *data_col,
 						const int stride_h, const int stride_w,
 						const int dilation_h, const int dilation_w
 						) {
-  // NOTE: current implementation has all warpN's repeating the same calculation if they are under the same blockM. May cause unwanted bandwidth pressure.
   int s_col;
   int r_col;
   int c_col;
@@ -298,7 +297,7 @@ __global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
 	
 	// Perform the matrix multiplication
 	wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-	
+
       }
    }
    
@@ -309,7 +308,7 @@ __global__ void stages1_2_gpu_kernel(float *offset, float *deformed_columns_in,
      wmma::store_matrix_sync(offset + cRow + cCol * ldc, acc_frag, ldc, wmma::mem_col_major);
      //wmma::store_matrix_sync(offsetsss, acc_frag, 64, wmma::mem_col_major);
    }
-   
+  
    // Perform BLI + unroll for main CONV
    const int BLI_TILE = M_stride * N_stride;
    const float *data_offset_ptr = offset + (((n_col * H + h_col) * W + w_col) * C_offset); // C_offset = R*S*2
@@ -340,6 +339,27 @@ __global__ void convert_fp32_bf16 (__nv_bfloat16 *out, float *in, int n) {
   }
 }
 
+float calculateSD(float data[], int len) {
+  float sum = 0.0, mean, standardDeviation = 0.0;
+  int i;
+
+  for(i = 0; i < len; ++i) {
+    sum += data[i];
+  }
+
+  mean = sum / len;
+
+  for(i = 0; i < 10; ++i) {
+    standardDeviation += pow(data[i] - mean, 2);
+  }
+
+  standardDeviation = sqrt(standardDeviation / len);
+
+  printf("Mean %f, std %f\n", mean, standardDeviation);
+  
+  return standardDeviation;
+}
+
 int main(int argc, char* argv[]) {
    float *in_fp32;
    float *weight_offset_fp32;
@@ -362,15 +382,17 @@ int main(int argc, char* argv[]) {
    cudaErrCheck(cudaEventCreate(&stopConvertWeight));
    cudaErrCheck(cudaEventCreate(&startWMMA));
    cudaErrCheck(cudaEventCreate(&stopWMMA));
-   
+
+   int tile_h = 16; // 16x8 is chosen to match the 128m warp
+   int tile_w = 8;
    
    // Use tensor cores
-   cudaErrCheck(cudaMalloc((void**)&in_fp32, N*H*W*C * sizeof(float)));
+   cudaErrCheck(cudaMalloc((void**)&in_fp32, N*H*W*C * sizeof(float)));                           // Actual shape: [N, H//tile_h, W//tile_w, tile_h, tile_w, C]
    cudaErrCheck(cudaMalloc((void**)&weight_offset_fp32, C_offset*C*R*S * sizeof(float)));
-   cudaErrCheck(cudaMalloc((void**)&columns_in_bf16, N*H*W*C*R*S * sizeof(__nv_bfloat16)));
+   cudaErrCheck(cudaMalloc((void**)&columns_in_bf16, N*H*W*C*R*S * sizeof(__nv_bfloat16)));       // Actual shape: [N, H//tile_h, W//tile_w, tile_h, tile_w, C, R, S]
    cudaErrCheck(cudaMalloc((void**)&weight_offset_bf16, C_offset*C*R*S * sizeof(__nv_bfloat16)));
-   cudaErrCheck(cudaMalloc((void**)&offset_fp32, N*C_offset*H*W * sizeof(float)));
-   cudaErrCheck(cudaMalloc((void**)&deformed_columns_in_fp32, N*H*W*C*R*S * sizeof(float)));
+   cudaErrCheck(cudaMalloc((void**)&offset_fp32, N*C_offset*H*W * sizeof(float)));                // FUTURE: make temporary local array
+   cudaErrCheck(cudaMalloc((void**)&deformed_columns_in_fp32, N*H*W*C*R*S * sizeof(float)));      
    
    offset_fp32_host = (float*)malloc(N*C_offset*H*W * sizeof(float));
    deformed_columns_in_fp32_host = (float*)malloc(N*H*W*C*R*S * sizeof(float));
@@ -378,8 +400,10 @@ int main(int argc, char* argv[]) {
    curandErrCheck(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
    curandErrCheck(curandSetPseudoRandomGeneratorSeed(gen, 1337ULL));
    
-   curandErrCheck(curandGenerateUniform(gen, in_fp32, N*C*H*W));
-   curandErrCheck(curandGenerateUniform(gen, weight_offset_fp32, C_offset*C*R*S));
+   //curandErrCheck(curandGenerateUniform(gen, in_fp32, N*C*H*W));
+   //curandErrCheck(curandGenerateUniform(gen, weight_offset_fp32, C_offset*C*R*S));
+   curandErrCheck(curandGenerateNormal(gen, in_fp32, N*C*H*W, 0, 0.2));
+   curandErrCheck(curandGenerateNormal(gen, weight_offset_fp32, C_offset*C*R*S, 0, 0.01));
    
    curandErrCheck(curandDestroyGenerator(gen));
 
@@ -437,6 +461,8 @@ int main(int argc, char* argv[]) {
    cudaErrCheck(cudaMemcpy(deformed_columns_in_fp32_host, deformed_columns_in_fp32, N*H*W*C*R*S * sizeof(float), cudaMemcpyDeviceToHost));
    
    /*
+   unsigned reasonable = 0;
+   unsigned unreasonable = 0;
    printf("Offset result\n");
    for (int i = 0; i < MATRIX_M; i++) {
        for (int j = 0; j < MATRIX_N; j++) {
@@ -446,17 +472,21 @@ int main(int argc, char* argv[]) {
 	   //  printf("Zero detected at idx=%d N/H/W = %d/%d/%d, K = %d\n", i, (i/W/H)%N, (i/W)%H, i%W, j);
 	   //  exit(0);
 	   //}
-	   if (v1 < 64) {
-	     printf("Reasonable offset detected at idx=%d N/H/W = %d/%d/%d, K = %d. VALUE = %f\n", i, (i/W/H)%N, (i/W)%H, i%W, j, v1);
+	   if (v1 < 10) {
+	     //printf("Reasonable offset detected at idx=%d N/H/W = %d/%d/%d, K = %d. VALUE = %f\n", i, (i/W/H)%N, (i/W)%H, i%W, j, v1);
+	     reasonable++;
 	   }
 	   else {
-	     printf("*Unreasonable offset detected at idx=%d N/H/W = %d/%d/%d, K = %d. VALUE = %f\n", i, (i/W/H)%N, (i/W)%H, i%W, j, v1);
+	     //printf("*Unreasonable offset detected at idx=%d N/H/W = %d/%d/%d, K = %d. VALUE = %f\n", i, (i/W/H)%N, (i/W)%H, i%W, j, v1);
+	     unreasonable++;
 	   }
        }
        //printf("\n");
    }
-   printf("Last: %f, +1: %f\n", offset_fp32_host[N*C_offset*H*W-1], offset_fp32_host[N*C_offset*H*W]);
-   printf("MATRIX_M = %d\n", MATRIX_M);
+   //printf("Last: %f, +1: %f\n", offset_fp32_host[N*C_offset*H*W-1], offset_fp32_host[N*C_offset*H*W]);
+   //printf("MATRIX_M = %d\n", MATRIX_M);
+   printf("Ratio of reasonable offsets: %f\n", (float)reasonable / (reasonable + unreasonable));
+   calculateSD(offset_fp32_host, MATRIX_M*MATRIX_N);
    //*/
 
    /*
